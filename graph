@@ -1,0 +1,114 @@
+# ===========================================
+# Sector market-cap coverage histogram (Components)
+# ===========================================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+import re
+
+# --------- 0) DOVE SI TROVA IL FILE? ---------
+# A) METTI IL TUO PERCORSO QUI (consigliato)
+#    Esempio Windows: r"C:\Users\...\Downloads\SHCOMP_prices_mktcap_volum_shares - ELABORATED.xlsx"
+XLSX_PATH = r""  # <-- lascia vuoto per la ricerca automatica
+
+# B) OPPURE: CERCA AUTOMATICAMENTE IL FILE (se A è vuoto)
+def find_excel(patterns=("SHCOMP", "ELABORATED"), exts=(".xlsx", ".xls")):
+    hits = []
+    for p in Path(".").rglob("*"):
+        if p.is_file() and p.suffix.lower() in exts:
+            name = p.name.lower()
+            if all(k.lower() in name for k in patterns):
+                hits.append(p)
+    if not hits:
+        return None
+    # scegli il più recente
+    hits.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(hits[0])
+
+if not XLSX_PATH:
+    found = find_excel()
+    if not found:
+        raise FileNotFoundError(
+            "File Excel non trovato. "
+            "Metti il percorso in XLSX_PATH (sopra) OPPURE posiziona il file nella cartella del notebook."
+        )
+    XLSX_PATH = found
+
+print(f"Usando il file: {XLSX_PATH}")
+
+# --------- 1) APRI LO SHEET 'Components' (o simile) ---------
+xl = pd.ExcelFile(XLSX_PATH)
+sheet = next((s for s in xl.sheet_names if "component" in s.lower()), xl.sheet_names[0])
+print(f"Usando lo sheet: {sheet}")
+df = xl.parse(sheet)
+df.columns = [c.strip() for c in df.columns]
+
+# --------- 2) INDIVIDUA COLONNE CHIAVE ---------
+# Settore
+sector_col = next(
+    (c for c in df.columns if re.sub(r"\s+", " ", c.lower()) in {
+        "gics sector", "sector", "industry sector", "sector name"
+    } or ("gics" in c.lower() and "sector" in c.lower())),
+    None
+)
+# Peso (proxy del market cap nella pagina Components)
+weight_col = next((c for c in df.columns if c.strip().lower() in {"weight", "index weight", "wgt"}), None)
+
+if sector_col is None or weight_col is None:
+    raise ValueError(
+        f"Colonne non trovate. Settore: {sector_col}, Peso: {weight_col}\n"
+        f"Colonne disponibili:\n{list(df.columns)}"
+    )
+
+# Flag del campione (se esiste)
+sample_flag = next(
+    (c for c in df.columns if c.strip().lower() in
+     {"in sample","in_sample","selected","is_sample","sample","is in sample","is_in_sample"}),
+    None
+)
+
+# --------- 3) COSTRUISCI IL CAMPIONE ---------
+df[weight_col] = pd.to_numeric(df[weight_col], errors="coerce")
+df = df.dropna(subset=[sector_col, weight_col]).copy()
+
+if sample_flag:
+    s = df[sample_flag].astype(str).str.strip().str.lower()
+    s = s.replace({"yes":"1","y":"1","true":"1","t":"1","si":"1","sì":"1"})
+    df["in_sample"] = pd.to_numeric(s, errors="coerce").fillna(0).astype(int).astype(bool)
+else:
+    df = df.sort_values(weight_col, ascending=False)
+    df["in_sample"] = False
+    df.loc[df.index[:999], "in_sample"] = True  # top 999 per peso
+
+# --------- 4) CALCOLO COPERTURA PER SETTORE ---------
+tot_sector = df.groupby(sector_col, dropna=False)[weight_col].sum().rename("Sector Total Weight")
+smp_sector = df.loc[df["in_sample"]].groupby(sector_col, dropna=False)[weight_col].sum().rename("Sample Weight")
+
+coverage = pd.concat([tot_sector, smp_sector], axis=1).fillna(0.0).reset_index().rename(columns={sector_col: "Sector"})
+coverage["Coverage (%)"] = (coverage["Sample Weight"] / coverage["Sector Total Weight"] * 100).round(1)
+coverage = coverage.sort_values("Coverage (%)", ascending=False).reset_index(drop=True)
+
+# --------- 5) GRAFICO (istogramma, toni giallo chiaro) ---------
+cmap = plt.colormaps["YlOrBr"]
+colors = cmap(np.linspace(0.20, 0.50, len(coverage)))   # gamma chiara (no marroni scuri)
+
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.bar(coverage["Sector"], coverage["Coverage (%)"], color=colors, edgecolor="white")
+
+for i, y in enumerate(coverage["Coverage (%)"]):
+    ax.text(i, y + max(coverage["Coverage (%)"])*0.02, f"{y:.1f}%", ha="center", va="bottom", fontsize=9, color="#333")
+
+ax.set_ylabel("Sample coverage of sector market cap (%)")
+ax.set_xlabel("Sector")
+ax.set_ylim(0, max(coverage["Coverage (%)"]) * 1.20 if len(coverage) else 100)
+ax.set_title("Sector market-cap coverage by the 999-firm sample (Components sheet)", pad=4)
+plt.xticks(rotation=30, ha="right")
+
+fig.tight_layout()
+fig.savefig("sector_mcap_coverage_hist_components.png", dpi=300, transparent=True, bbox_inches="tight", pad_inches=0.05)
+coverage.to_csv("sector_mcap_coverage_hist_components.csv", index=False)
+
+print("✅ Salvati:")
+print(" - sector_mcap_coverage_hist_components.png")
+print(" - sector_mcap_coverage_hist_components.csv")
